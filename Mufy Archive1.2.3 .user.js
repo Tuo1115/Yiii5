@@ -1,0 +1,1896 @@
+// ==UserScript==
+// @name         Mufy Archive — 无限存档与跨号导入
+// @namespace    mufy-archive
+// @version      1.2.3
+// @description  无限本地存档 | 视觉层伪装载入 | 前情提要记忆注入 | 跨号迁移工具（Claude 复查修复版）
+// @author       千问Go!
+// @match        https://chat.mufy.ai/*
+// @grant        none
+// @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/Tuo1115/Yiii5/main/mufy-archive.user.js
+// @downloadURL  https://raw.githubusercontent.com/Tuo1115/Yiii5/main/mufy-archive.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ════════════════════════════════════════════════════════════════
+   * CONFIG
+   * ════════════════════════════════════════════════════════════════ */
+  const CONFIG = {
+    DB_NAME: 'MufyArchiveDB',
+    DB_VERSION: 1,
+    STORE_ARCHIVES: 'archives',
+    STORE_META: 'meta',
+    PANEL_ID: 'ma-panel',
+    TOAST_ID: 'ma-toast',
+    CSS_ID: 'ma-styles',
+    API_BASE: 'https://chat.mufy.ai/api',
+    API_V1: 'https://chat.mufy.ai/api/v1',
+    // v1.2.2：HTTPS 页面里把同域的 ws:// 自动升级为 wss://，
+    // 修复平台自身代码造成的 Mixed Content 报错（脚本从未碰过 WebSocket）。
+    // 若服务器不支持 WSS 导致新的连接失败报错，把这里改成 false 回退。
+    WS_UPGRADE: true,
+    // v1.2.3：网络审计 —— 记录页面发出的 /api/ 请求与 WebSocket 消息类型
+    // （只记类型/字段名，不记内容），用于定位"聊天记录到底走哪条通道"，
+    // 是诊断伪装载入不生效的关键工具。定位完成后可关掉。
+    WS_AUDIT: true,
+    NET_LOG_MAX: 120,
+    INTERCEPT_PATTERNS: [
+      '/api/sessions/query_archives',
+      '/api/sessions/export/query_dialogs',
+      '/api/dialogs/query',
+      '/api/characters/get',
+      '/api/v1/chat/completions',
+    ],
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * STATE
+   * ════════════════════════════════════════════════════════════════ */
+  const State = {
+    db: null,
+    ctx: {
+      characterId: null,
+      sessionId: null,
+      maskId: null,
+      modelId: null,
+      modelTemplateId: null,
+      characterName: null,
+      userName: null,
+      ready: false,
+    },
+    phantom: {
+      active: false,
+      dialogs: null,
+      archiveId: null,
+    },
+    captured: {
+      characterInfo: null,
+      chatParams: null,
+      dialogs: null,      // last dialogs array the interceptor actually saw go past
+      dialogsMeta: null,  // { sessionId, characterId, at } for the above
+    },
+    logs: [],
+    netLog: [], // v1.2.3：网络审计清单
+    panelVisible: false,
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * IDEMPOTENCY — don't re-prime a session that already got a summary sent
+   * ════════════════════════════════════════════════════════════════ */
+  const SENT_KEY = 'ma-summary-sent';
+  function markSummarySent(sessionId) {
+    try {
+      const raw = localStorage.getItem(SENT_KEY);
+      const map = raw ? JSON.parse(raw) : {};
+      map[sessionId] = Date.now();
+      localStorage.setItem(SENT_KEY, JSON.stringify(map));
+    } catch {}
+  }
+  function wasSummarySent(sessionId) {
+    try {
+      const raw = localStorage.getItem(SENT_KEY);
+      const map = raw ? JSON.parse(raw) : {};
+      return !!map[sessionId];
+    } catch { return false; }
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+   * UTILS
+   * ════════════════════════════════════════════════════════════════ */
+  const Utils = {
+    uuid() {
+      return 'ma-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    },
+    debounce(fn, wait = 300) {
+      let t;
+      return (...args) => {
+        clearTimeout(t);
+        t = setTimeout(() => fn(...args), wait);
+      };
+    },
+    formatDate(ts) {
+      if (!ts) return '--';
+      const d = new Date(ts);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    },
+    escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s ?? '';
+      return d.innerHTML;
+    },
+    truncate(s, n = 80) {
+      if (!s) return '';
+      return s.length > n ? s.slice(0, n) + '…' : s;
+    },
+    download(filename, content, mime = 'application/json') {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    },
+    async readJsonFile(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => {
+          try { resolve(JSON.parse(r.result)); }
+          catch (e) { reject(e); }
+        };
+        r.onerror = () => reject(r.error);
+        r.readAsText(file);
+      });
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * LOGGER
+   * ════════════════════════════════════════════════════════════════ */
+  const Log = {
+    add(msg, level = 'info') {
+      const entry = {
+        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        level,
+        msg: typeof msg === 'string' ? msg : JSON.stringify(msg),
+      };
+      State.logs.push(entry);
+      if (State.logs.length > 200) State.logs.shift();
+      const el = document.querySelector('#ma-debug-log');
+      if (el) {
+        const div = document.createElement('div');
+        div.className = `ma-log ma-log--${level}`;
+        div.textContent = `[${entry.time}] ${entry.msg}`;
+        el.appendChild(div);
+        el.scrollTop = el.scrollHeight;
+      }
+      if (level === 'error') console.error('[MufyArchive]', msg);
+      else if (level === 'warn') console.warn('[MufyArchive]', msg);
+      else console.log('[MufyArchive]', msg);
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * NET LOG — v1.2.3 网络审计
+   * 记录页面发出的 /api/ 请求（方法/路径/参数/状态码）和 WebSocket 消息
+   * 的类型与字段名。只记"形状"不记内容，隐私安全；同一形状只记一次。
+   * 用途：定位聊天记录的真实加载通道（fetch/XHR 还是 WebSocket）。
+   * ════════════════════════════════════════════════════════════════ */
+  const NetLog = {
+    _seen: new Set(),
+    _wsSeen: {},
+    add(kind, method, url, status) {
+      try {
+        const u = new URL(url, location.origin);
+        if (!u.pathname.includes('/api/')) return;
+        // 去重键 = 路径 + 参数名集合（参数值变化如翻页不算新形状）
+        const shape = [...u.searchParams.keys()].sort().join(',');
+        const key = kind + u.pathname + '?' + shape;
+        if (this._seen.has(key)) return;
+        this._seen.add(key);
+        const q = u.searchParams.toString();
+        const line = `[${kind}] ${method || 'GET'} ${u.pathname}${q ? '?' + q : ''}${status ? ' → ' + status : ''}`;
+        State.netLog.push(line.length > 220 ? line.slice(0, 220) + '…' : line);
+        if (State.netLog.length > CONFIG.NET_LOG_MAX) State.netLog.shift();
+      } catch {}
+    },
+    addWS(dir, data) {
+      try {
+        let type = '?', keys = '';
+        if (typeof data === 'string') {
+          try {
+            const j = JSON.parse(data);
+            type = String(j.type ?? j.event ?? j.op ?? j.action ?? '?');
+            keys = Object.keys(j).slice(0, 6).join(',');
+          } catch { type = '(non-json)'; }
+        } else if (data instanceof Blob) { type = '(blob)'; }
+        else { type = '(binary)'; }
+        const key = dir + '|' + type + '|' + keys;
+        if (this._wsSeen[key]) return;
+        this._wsSeen[key] = true;
+        State.netLog.push(`[ws-${dir}] type=${type}${keys ? ' keys=[' + keys + ']' : ''}`);
+        if (State.netLog.length > CONFIG.NET_LOG_MAX) State.netLog.shift();
+      } catch {}
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * STORAGE (IndexedDB)
+   * ════════════════════════════════════════════════════════════════ */
+  const DB = {
+    async open() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(CONFIG.DB_NAME, CONFIG.DB_VERSION);
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains(CONFIG.STORE_ARCHIVES)) {
+            const store = db.createObjectStore(CONFIG.STORE_ARCHIVES, { keyPath: 'id' });
+            store.createIndex('characterId', 'characterId', { unique: false });
+            store.createIndex('createdAt', 'createdAt', { unique: false });
+          }
+          if (!db.objectStoreNames.contains(CONFIG.STORE_META)) {
+            db.createObjectStore(CONFIG.STORE_META, { keyPath: 'key' });
+          }
+        };
+        req.onsuccess = () => { State.db = req.result; resolve(req.result); };
+        req.onerror = () => reject(req.error);
+      });
+    },
+    async put(archive) {
+      const db = State.db || (await this.open());
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(CONFIG.STORE_ARCHIVES, 'readwrite');
+        tx.objectStore(CONFIG.STORE_ARCHIVES).put(archive);
+        tx.oncomplete = () => resolve(archive);
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+    async get(id) {
+      const db = State.db || (await this.open());
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(CONFIG.STORE_ARCHIVES, 'readonly');
+        const req = tx.objectStore(CONFIG.STORE_ARCHIVES).get(id);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    },
+    async getAll() {
+      const db = State.db || (await this.open());
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(CONFIG.STORE_ARCHIVES, 'readonly');
+        const req = tx.objectStore(CONFIG.STORE_ARCHIVES).getAll();
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    },
+    async delete(id) {
+      const db = State.db || (await this.open());
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(CONFIG.STORE_ARCHIVES, 'readwrite');
+        tx.objectStore(CONFIG.STORE_ARCHIVES).delete(id);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+    async clear() {
+      const db = State.db || (await this.open());
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(CONFIG.STORE_ARCHIVES, 'readwrite');
+        tx.objectStore(CONFIG.STORE_ARCHIVES).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * API CLIENT
+   * ════════════════════════════════════════════════════════════════ */
+  const API = {
+    getToken() {
+      try {
+        const raw = localStorage.getItem('token') || localStorage.getItem('Authorization') || '';
+        if (raw) return raw.replace(/^Bearer\s+/i, '').replace(/^"|"$/g, '');
+        for (const key of ['userInfo', 'user', 'auth']) {
+          const v = localStorage.getItem(key);
+          if (v) {
+            try {
+              const obj = JSON.parse(v);
+              if (obj.token) return obj.token;
+            } catch {}
+          }
+        }
+        return null;
+      } catch { return null; }
+    },
+    authHeaders() {
+      const token = this.getToken();
+      return token ? { Authorization: `Bearer ${token}` } : {};
+    },
+    async getArchives(characterId) {
+      const url = `${CONFIG.API_BASE}/sessions/query_archives?characterId=${characterId}&pageNum=1&pageSize=100`;
+      const res = await fetch(url, { headers: this.authHeaders(), credentials: 'include' });
+      return res.json();
+    },
+    async getDialogs(archiveId) {
+      const url = `${CONFIG.API_BASE}/sessions/export/query_dialogs?archiveId=${archiveId}`;
+      const res = await fetch(url, { headers: this.authHeaders(), credentials: 'include' });
+      return res.json();
+    },
+    async getCharacter(characterId, maskId) {
+      const params = new URLSearchParams({ id: characterId });
+      if (maskId) params.set('maskId', maskId);
+      const url = `${CONFIG.API_BASE}/characters/get?${params}`;
+      const res = await fetch(url, { headers: this.authHeaders(), credentials: 'include' });
+      return res.json();
+    },
+    async queryDialogs(sessionId, characterId, pageNum = 1, pageSize = 100) {
+      const params = new URLSearchParams({
+        sessionId, characterId,
+        pageNum: String(pageNum), pageSize: String(pageSize),
+      });
+      const url = `${CONFIG.API_BASE}/dialogs/query?${params}`;
+      const res = await fetch(url, { headers: this.authHeaders(), credentials: 'include' });
+      return res.json();
+    },
+
+    // ═══ v1.2.1：分页抓全量对话 ═══
+    // 终止条件：页 < pageSize / 页 > pageSize（服务端没按分页来）/ 累计 ≥ total / 200 页硬上限
+    async queryDialogsAll(sessionId, characterId, { pageSize = 100, onProgress = null } = {}) {
+      const MAX_PAGES = 200;
+      const all = [];
+      let pageNum = 1;
+      let total = null;
+      let hitCap = false;
+
+      while (true) {
+        const res = await this.queryDialogs(sessionId, characterId, pageNum, pageSize);
+        const env = res?.data;
+        const page = Array.isArray(env?.data) ? env.data : (Array.isArray(env) ? env : []);
+        if (typeof env?.total === 'number') total = env.total;
+
+        if (!page.length) break;
+        if (page.length > pageSize) { all.push(...page); break; }
+        all.push(...page);
+        if (onProgress) { try { onProgress(all.length, total); } catch {} }
+
+        if (page.length < pageSize) break;
+        if (total != null && all.length >= total) break;
+        if (pageNum >= MAX_PAGES) { hitCap = true; break; }
+
+        pageNum++;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+
+      const partial = hitCap || (total != null && all.length < total);
+      return { dialogs: all, total, pages: pageNum, partial };
+    },
+
+    async sendChat({ characterId, maskId, modelId, modelTemplateId, sessionId, userInput }) {
+      const body = {
+        characterId, maskId,
+        modelId: modelId ?? 0,
+        modelTemplateId: modelTemplateId ?? 0,
+        sessionId,
+        itemText: null,
+        skipRedPacket: false,
+        userInput,
+      };
+      Log.add(`发送消息 → POST /api/v1/chat/completions`, 'info');
+      const res = await fetch(`${CONFIG.API_V1}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...this.authHeaders() },
+        credentials: 'include',
+        body: JSON.stringify(body),
+      });
+      return res;
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * CONTEXT DETECTOR
+   * ════════════════════════════════════════════════════════════════ */
+  const Context = {
+    _lastSig: null,
+    detect() {
+      const ctx = State.ctx;
+      ctx.ready = false;
+
+      // 1. From URL — /explore 等非聊天页没有这些参数，四路全空是正常现象
+      try {
+        const qs = new URL(location.href).searchParams;
+        const roleId = qs.get('roleId') || qs.get('characterId');
+        const sid = qs.get('sessionId');
+        if (roleId) ctx.characterId = roleId;
+        if (sid) ctx.sessionId = sid;
+      } catch {}
+
+      // 2. From localStorage
+      try {
+        for (const key of ['sessionId', 'currentSessionId', 'session_id']) {
+          const v = localStorage.getItem(key);
+          if (v) { ctx.sessionId = v.replace(/^"|"$/g, ''); break; }
+        }
+        for (const key of ['characterId', 'character_id', 'currentCharacterId']) {
+          const v = localStorage.getItem(key);
+          if (v) { ctx.characterId = v.replace(/^"|"$/g, ''); break; }
+        }
+        for (const key of ['maskId', 'currentMaskId', 'mask_id']) {
+          const v = localStorage.getItem(key);
+          if (v) { ctx.maskId = v.replace(/^"|"$/g, ''); break; }
+        }
+      } catch {}
+
+      // 3. From DOM
+      const chatEl = document.querySelector('[data-character-id], [data-characterid]');
+      if (chatEl) {
+        ctx.characterId = chatEl.getAttribute('data-character-id') || chatEl.getAttribute('data-characterid') || ctx.characterId;
+      }
+      const sessionEl = document.querySelector('[data-session-id], [data-sessionid]');
+      if (sessionEl) {
+        ctx.sessionId = sessionEl.getAttribute('data-session-id') || sessionEl.getAttribute('data-sessionid') || ctx.sessionId;
+      }
+
+      // 4. From captured API data
+      if (State.captured.characterInfo) {
+        const ci = State.captured.characterInfo;
+        ctx.characterName = ci.name || ci.characterName || ctx.characterName;
+        ctx.userName = ci.userName || ctx.userName;
+        ctx.maskId = ci.currentMaskId || ci.maskId || ctx.maskId;
+        ctx.modelId = ci.modelId || ctx.modelId;
+        ctx.modelTemplateId = ci.modelTemplateId || ctx.modelTemplateId;
+      }
+
+      ctx.ready = !!(ctx.characterId);
+      const sig = `${ctx.characterId}|${ctx.maskId}|${ctx.sessionId}|${ctx.ready}`;
+      if (sig !== this._lastSig) {
+        this._lastSig = sig;
+        Log.add(`Context: char=${ctx.characterId} mask=${ctx.maskId} session=${ctx.sessionId} ready=${ctx.ready}`);
+      }
+      return ctx;
+    },
+    onNavigate(cb) {
+      const wrap = (method) => {
+        const orig = history[method];
+        history[method] = function (...args) {
+          const r = orig.apply(this, args);
+          setTimeout(cb, 100);
+          return r;
+        };
+      };
+      wrap('pushState');
+      wrap('replaceState');
+      window.addEventListener('popstate', () => setTimeout(cb, 100));
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * INTERCEPTOR (fetch/XHR hook — installed at document-start)
+   * ════════════════════════════════════════════════════════════════ */
+  const Interceptor = {
+    _originalFetch: null,
+    _originalXHR: null,
+    install() {
+      // v1.2.2/1.2.3：WebSocket 补丁（ws→wss 升级 + 消息类型审计），
+      // 必须抢在页面代码第一次 new WebSocket 之前装好
+      this._installWSHook();
+
+      // --- fetch hook ---
+      if (!window.fetch.__ma_hooked) {
+        this._originalFetch = window.fetch;
+        const self = this;
+        window.fetch = async function (input, init) {
+          const url = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+          let finalInput = input;
+          if (url.includes('/api/dialogs/query')) {
+            finalInput = self._fixQueryParams(input, url);
+          }
+          const response = await self._originalFetch.call(this, finalInput, init);
+          // v1.2.3 网络审计：记录所有 /api/ 请求（含状态码）
+          try {
+            NetLog.add('fetch', (init && init.method) || (input instanceof Request ? input.method : 'GET'), url, response.status);
+          } catch {}
+          if (self._shouldIntercept(url)) {
+            try {
+              return await self._handleResponse(url, response);
+            } catch (e) {
+              Log.add(`Interceptor error: ${e.message}`, 'error');
+              return response;
+            }
+          }
+          return response;
+        };
+        window.fetch.__ma_hooked = true;
+        Log.add('fetch hook installed');
+      }
+      // --- XHR hook (fallback) ---
+      if (!XMLHttpRequest.prototype.__ma_hooked) {
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSend = XMLHttpRequest.prototype.send;
+        const self = this;
+        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+          this.__ma_url = url;
+          this.__ma_method = method;
+          return origOpen.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.send = function (body) {
+          if (this.__ma_url && this.__ma_url.includes('/api/')) {
+            this.addEventListener('loadend', function () {
+              try { NetLog.add('xhr', this.__ma_method, this.__ma_url, this.status); } catch {}
+            });
+          }
+          if (this.__ma_url && self._shouldIntercept(this.__ma_url)) {
+            this.addEventListener('load', function () {
+              try { self._captureFromXHR(this.__ma_url, this.responseText); } catch {}
+            });
+          }
+          return origSend.call(this, body);
+        };
+        XMLHttpRequest.prototype.__ma_hooked = true;
+      }
+    },
+
+    // ═══ v1.2.2/1.2.3：WebSocket 钩子 ═══
+    // 1) ws→wss 同域升级：修平台自身造成的 Mixed Content（真修复，连接直接成功）
+    // 2) 消息类型审计：记录收发消息的 type/字段名，定位聊天记录的真实通道
+    //    （只记形状不记内容；只升级同域连接，不误伤第三方端点）
+    _installWSHook() {
+      if (window.WebSocket.__ma_hooked) return;
+      const doUpgrade = CONFIG.WS_UPGRADE && location.protocol === 'https:';
+      try {
+        const OrigWS = window.WebSocket;
+        class PatchedWebSocket extends OrigWS {
+          constructor(url, protocols) {
+            let finalUrl = url;
+            try {
+              if (doUpgrade && typeof finalUrl === 'string' && finalUrl.startsWith('ws://')) {
+                const u = new URL(finalUrl);
+                if (u.hostname === location.hostname) {
+                  finalUrl = `wss://${u.host}${u.pathname}${u.search}`;
+                  Log.add(`WebSocket 已升级 ws→wss：${finalUrl}`, 'info');
+                }
+              }
+            } catch {}
+            super(finalUrl, protocols);
+            if (CONFIG.WS_AUDIT) {
+              try {
+                this.addEventListener('message', (e) => NetLog.addWS('in', e.data));
+                const origSend = this.send.bind(this);
+                this.send = (d) => { try { NetLog.addWS('out', d); } catch {} return origSend(d); };
+              } catch {}
+            }
+          }
+        }
+        window.WebSocket = PatchedWebSocket;
+        window.WebSocket.__ma_hooked = true;
+        Log.add(`WebSocket patch installed (${doUpgrade ? 'ws→wss upgrade' : 'observe-only'}${CONFIG.WS_AUDIT ? ' + audit' : ''})`);
+      } catch (e) {
+        Log.add(`WebSocket patch failed: ${e.message}`, 'warn');
+      }
+    },
+
+    _fixQueryParams(input, urlString) {
+      try {
+        const u = new URL(urlString, location.origin);
+        let changed = false;
+        if (!u.searchParams.has('pageNum') || !u.searchParams.get('pageNum')) {
+          u.searchParams.set('pageNum', '1'); changed = true;
+        }
+        if (!u.searchParams.has('pageSize') || !u.searchParams.get('pageSize')) {
+          u.searchParams.set('pageSize', '100'); changed = true;
+        }
+        if (!u.searchParams.has('characterId') || !u.searchParams.get('characterId')) {
+          if (State.ctx.characterId) {
+            u.searchParams.set('characterId', State.ctx.characterId); changed = true;
+          }
+        }
+        if (!changed) return input;
+        const newUrl = u.toString();
+        Log.add(`Fixed missing params → ${newUrl}`);
+        return typeof input === 'string' ? newUrl : new Request(newUrl, input);
+      } catch { return input; }
+    },
+    _shouldIntercept(url) {
+      return CONFIG.INTERCEPT_PATTERNS.some(p => url.includes(p));
+    },
+    async _handleResponse(url, response) {
+      // Phantom 命中：按请求的 pageNum/pageSize 切片返回（v1.2.1 修复）。
+      // 早退路径不变 —— mock 不会污染被动缓存。
+      if (url.includes('/api/dialogs/query') && State.phantom.active && State.phantom.dialogs) {
+        let pageNum = 1, pageSize = 100;
+        try {
+          const u = new URL(url, location.origin);
+          pageNum = Math.max(1, parseInt(u.searchParams.get('pageNum') || '1', 10) || 1);
+          pageSize = Math.max(1, parseInt(u.searchParams.get('pageSize') || '100', 10) || 100);
+        } catch {}
+        const start = (pageNum - 1) * pageSize;
+        const slice = State.phantom.dialogs.slice(start, start + pageSize);
+        Log.add(`Phantom 命中 → page ${pageNum} (size ${pageSize})，返回 ${slice.length} / 总 ${State.phantom.dialogs.length} 条`, 'info');
+        const mockData = {
+          code: 200,
+          msg: 'success',
+          data: {
+            data: slice,
+            total: State.phantom.dialogs.length,
+            pageNum,
+            pageSize,
+          },
+        };
+        return new Response(JSON.stringify(mockData), {
+          status: 200,
+          statusText: 'OK',
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Capture data from responses (non-destructive)
+      try {
+        const clone = response.clone();
+        if (clone.headers.get('content-type')?.includes('application/json')) {
+          const data = await clone.json();
+          this._captureData(url, data);
+        }
+      } catch {}
+      return response;
+    },
+    _captureData(url, data) {
+      if (url.includes('/api/characters/get')) {
+        const ci = data?.data || data;
+        State.captured.characterInfo = ci;
+        if (ci.currentMaskId != null) State.ctx.maskId = ci.currentMaskId;
+        if (ci.modelId != null) State.ctx.modelId = ci.modelId;
+        if (ci.modelTemplateId != null) State.ctx.modelTemplateId = ci.modelTemplateId;
+        if (ci.name) State.ctx.characterName = ci.name;
+        Log.add(`Captured character info: ${ci.name || '?'} mask=${ci.currentMaskId ?? '?'}`);
+        // v1.2.3：抓到新信息立即联动面板刷新（此前要等下一个 5 秒轮询或手动刷新）
+        try { window.dispatchEvent(new Event('ma-ctx-updated')); } catch {}
+      }
+      if (url.includes('/api/v1/chat/completions')) {
+        if (data && data.choices) {
+          Log.add('Captured chat completion response');
+        }
+      }
+      if (url.includes('/api/sessions/query_archives')) {
+        if (data?.data?.data || data?.data) {
+          Log.add('Captured archive list from platform');
+        }
+      }
+      if (url.includes('/api/sessions/export/query_dialogs') || url.includes('/api/dialogs/query')) {
+        const dialogs = data?.data?.data || data?.data || [];
+        if (Array.isArray(dialogs) && dialogs.length > 0) {
+          let sid = null, cid = null;
+          try {
+            const u = new URL(url, location.origin);
+            sid = u.searchParams.get('sessionId');
+            cid = u.searchParams.get('characterId');
+          } catch {}
+          State.captured.dialogs = dialogs;
+          State.captured.dialogsMeta = { sessionId: sid, characterId: cid, at: Date.now() };
+          Log.add(`Captured ${dialogs.length} dialogs from API (passive cache)`);
+        }
+      }
+    },
+    _captureFromXHR(url, responseText) {
+      try {
+        const data = JSON.parse(responseText);
+        this._captureData(url, data);
+      } catch {}
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * SUMMARY ENGINE
+   * ════════════════════════════════════════════════════════════════ */
+  const Summary = {
+    generate(archive) {
+      const dialogs = archive.dialogs || [];
+      const userName = archive.meta?.userName || State.ctx.userName || '用户';
+      const charName = archive.meta?.characterName || State.ctx.characterName || '角色';
+      const total = dialogs.length;
+
+      const exchanges = [];
+      for (const d of dialogs) {
+        const role = d.role || d.type || (d.isBot ? 'assistant' : 'user');
+        const content = d.content || d.text || d.message || '';
+        if (content.trim()) {
+          exchanges.push({ role, content: content.trim() });
+        }
+      }
+
+      const MAX_FULL = 10;
+      let body;
+      if (exchanges.length <= MAX_FULL) {
+        body = exchanges.map((e, i) => {
+          const speaker = e.role === 'user' || e.role === 'human' ? userName : charName;
+          return `${i + 1}. ${speaker}：${Utils.truncate(e.content, 200)}`;
+        }).join('\n\n');
+      } else {
+        const head = exchanges.slice(0, 4);
+        const tail = exchanges.slice(-4);
+        const headText = head.map((e, i) => {
+          const speaker = e.role === 'user' || e.role === 'human' ? userName : charName;
+          return `${i + 1}. ${speaker}：${Utils.truncate(e.content, 200)}`;
+        }).join('\n\n');
+        const tailText = tail.map((e, i) => {
+          const idx = exchanges.length - tail.length + i + 1;
+          const speaker = e.role === 'user' || e.role === 'human' ? userName : charName;
+          return `${idx}. ${speaker}：${Utils.truncate(e.content, 200)}`;
+        }).join('\n\n');
+        // v1.2.1 修复：省略数按实际展示的头尾条数计算
+        const omitted = exchanges.length - (head.length + tail.length);
+        body = `${headText}\n\n……（中间省略 ${omitted} 轮对话）……\n\n${tailText}`;
+      }
+
+      let summary = `（前情提要）${userName}与${charName}之间已有${total}条对话记录。以下是关键互动摘录：\n\n${body}\n\n请基于以上记忆继续对话，保持角色设定和剧情连贯性。`;
+      return summary;
+    },
+    fillInputBox(text) {
+      const selectors = [
+        'textarea[placeholder*="输入"]',
+        'textarea[placeholder*="消息"]',
+        'textarea[placeholder*="回复"]',
+        'textarea.chat-input',
+        'div[contenteditable="true"][class*="input"]',
+        'div[contenteditable="true"][class*="chat"]',
+        'textarea',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          if (el.tagName === 'TEXTAREA') {
+            const nativeSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+            if (nativeSetter) nativeSetter.call(el, text);
+            else el.value = text;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          } else if (el.contentEditable === 'true') {
+            el.textContent = text;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
+          }
+          Log.add(`前情提要已填入输入框 (${text.length} chars)`);
+          return true;
+        }
+      }
+      Log.add('未找到输入框，请手动粘贴', 'warn');
+      return false;
+    },
+    async autoSend(text) {
+      const ctx = State.ctx;
+      if (!ctx.characterId || !ctx.sessionId) {
+        Log.add('无法自动发送：缺少 characterId 或 sessionId', 'error');
+        return false;
+      }
+      if (wasSummarySent(ctx.sessionId)) {
+        Log.add('这个会话已经补过记忆了，不重复发送（真要重发，先在调试里清一下记录）', 'warn');
+        return false;
+      }
+
+      let beforeCount = 0;
+      try {
+        const before = await API.queryDialogs(ctx.sessionId, ctx.characterId);
+        beforeCount = (before?.data?.data || before?.data || []).length;
+      } catch {}
+
+      try {
+        const res = await API.sendChat({
+          characterId: ctx.characterId,
+          maskId: ctx.maskId,
+          modelId: ctx.modelId,
+          modelTemplateId: ctx.modelTemplateId,
+          sessionId: ctx.sessionId,
+          userInput: text,
+        });
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          Log.add(`自动发送失败: ${res.status} ${errText.slice(0, 200)}`, 'error');
+          return false;
+        }
+        const { text: replyText, dialogsId } = await parseSSE(res);
+        Log.add(`AI 已回复（${replyText.length} 字${dialogsId ? `，dialogsId=${dialogsId}` : ''}）`);
+
+        // 不只信 HTTP 200 —— 轮询服务端对话条数真实上涨才记成功
+        for (let i = 0; i < 8; i++) {
+          await new Promise((r) => setTimeout(r, 1500));
+          const after = await API.queryDialogs(ctx.sessionId, ctx.characterId).catch(() => null);
+          const afterCount = (after?.data?.data || after?.data || []).length;
+          if (afterCount > beforeCount) {
+            markSummarySent(ctx.sessionId);
+            Log.add('前情提要已发送，服务端对话条数确认增加', 'success');
+            return true;
+          }
+        }
+        Log.add('请求已发出，但服务端对话条数迟迟没涨，没有标记为成功——建议手动核实一下', 'warn');
+        return false;
+      } catch (e) {
+        Log.add(`自动发送异常: ${e.message}`, 'error');
+        return false;
+      }
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * SSE PARSER
+   * ════════════════════════════════════════════════════════════════ */
+  async function parseSSE(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+    let dialogsId = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim() || line.startsWith(':')) continue;
+        if (line.startsWith('data: ')) {
+          const payload = line.slice(6).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(payload);
+            if (parsed.choices?.[0]?.delta?.content) {
+              fullText += parsed.choices[0].delta.content;
+            }
+            if (parsed.content) {
+              fullText += parsed.content;
+            }
+            if (parsed.dialogsId) dialogsId = parsed.dialogsId;
+            if (parsed.id) dialogsId = parsed.id;
+          } catch {}
+        }
+      }
+    }
+    return { text: fullText, dialogsId };
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+   * PHANTOM PERSISTENCE — survive a hard F5 reload
+   * ════════════════════════════════════════════════════════════════ */
+  const PHANTOM_KEY = 'ma-phantom-state';
+  const Phantom = {
+    persist() {
+      try {
+        if (State.phantom.active && State.phantom.archiveId) {
+          localStorage.setItem(PHANTOM_KEY, JSON.stringify({ archiveId: State.phantom.archiveId }));
+        } else {
+          localStorage.removeItem(PHANTOM_KEY);
+        }
+      } catch {}
+    },
+    async restore() {
+      try {
+        const raw = localStorage.getItem(PHANTOM_KEY);
+        if (!raw) return false;
+        const { archiveId } = JSON.parse(raw);
+        if (!archiveId) return false;
+        const archive = await DB.get(archiveId);
+        if (!archive || !archive.dialogs) return false;
+        State.phantom.active = true;
+        State.phantom.dialogs = archive.dialogs;
+        State.phantom.archiveId = archiveId;
+        Log.add(`伪装载入状态已从上次刷新前恢复：${archive.name || archiveId}（${archive.dialogs.length} 条）`, 'success');
+        return true;
+      } catch (e) {
+        Log.add(`恢复伪装载入状态失败: ${e.message}`, 'error');
+        return false;
+      }
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * UI — STYLES
+   * v1.2.3 视觉大修：去全部斜体（中文伪斜体会变形）、字号整体上调、
+   * 面板加宽、波浪分隔线、FAB 漂浮动画（尊重 prefers-reduced-motion）
+   * ════════════════════════════════════════════════════════════════ */
+  const CSS = `
+    :root {
+      --ma-bg: #06141f;
+      --ma-surface: #0b1f30;
+      --ma-elevated: #102a40;
+      --ma-hover: #153550;
+      --ma-border: rgba(140,200,210,0.10);
+      --ma-border-strong: rgba(140,200,210,0.22);
+      --ma-text: #d5e7eb;
+      --ma-text-2: #8aa9b4;
+      --ma-text-3: #5c7d86;
+      --ma-accent: #5ecbc2;
+      --ma-accent-bg: rgba(94,203,194,0.10);
+      --ma-accent-hover: rgba(94,203,194,0.18);
+      --ma-seal: #d79a5c;
+      --ma-seal-bg: rgba(215,154,92,0.12);
+      --ma-danger: #c97f6e;
+      --ma-danger-bg: rgba(192,122,106,0.12);
+      --ma-success: #6fb8a8;
+      --ma-success-bg: rgba(111,184,168,0.12);
+      --ma-radius: 12px;
+      --ma-font: -apple-system, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --ma-font-serif: Georgia, "Noto Serif SC", "Songti SC", "STSong", serif;
+      --ma-mono: "SF Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    }
+    #ma-panel * { margin: 0; padding: 0; box-sizing: border-box; font-family: var(--ma-font); -webkit-font-smoothing: antialiased; }
+    #ma-panel {
+      position: fixed; top: 80px; right: 24px; width: 400px; max-height: 76vh;
+      background: var(--ma-bg); border: 1px solid var(--ma-border); border-radius: 16px;
+      display: flex; flex-direction: column; z-index: 2147483646;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.3);
+      overflow: hidden;
+      transition: transform 0.3s cubic-bezier(0.4,0,0.2,1), opacity 0.3s ease;
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    }
+    #ma-panel::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, var(--ma-accent), transparent);
+      opacity: 0.7; background-size: 200% 100%;
+      animation: ma-drift 6s ease-in-out infinite;
+    }
+    @keyframes ma-drift { 0%, 100% { background-position: 0% 0%; } 50% { background-position: 100% 0%; } }
+    #ma-panel.ma-hidden { transform: translateX(440px); opacity: 0; pointer-events: none; }
+    .ma-panel__header {
+      position: relative;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px 16px;
+      background: radial-gradient(120% 140% at 0% 0%, rgba(94,203,194,0.08), transparent 55%), var(--ma-bg);
+      cursor: move; user-select: none;
+    }
+    /* v1.2.3：波浪分隔线（漂流瓶主题的核心视觉元素） */
+    .ma-panel__header::after {
+      content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 7px;
+      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='7' viewBox='0 0 40 7'%3E%3Cpath d='M0 4 Q5 0.5 10 4 T20 4 T30 4 T40 4' fill='none' stroke='%235ecbc2' stroke-opacity='0.4' stroke-width='1.4'/%3E%3C/svg%3E") repeat-x left center;
+      pointer-events: none;
+    }
+    .ma-panel__title { display: flex; flex-direction: column; gap: 3px; }
+    .ma-panel__title-main {
+      display: flex; align-items: center; gap: 7px;
+      font-family: var(--ma-font-serif); font-size: 17px; font-weight: 600;
+      letter-spacing: 0.5px; color: var(--ma-text);
+    }
+    .ma-panel__title-main svg { color: var(--ma-accent); flex: none; }
+    .ma-panel__title-sub {
+      font-size: 10px; font-weight: 500; letter-spacing: 1.5px;
+      text-transform: uppercase; color: var(--ma-text-3);
+    }
+    .ma-panel__ctrls { display: flex; gap: 4px; }
+    .ma-btn-icon {
+      width: 30px; height: 30px; border: none; background: transparent;
+      color: var(--ma-text-3); font-size: 16px; cursor: pointer; border-radius: 6px;
+      display: flex; align-items: center; justify-content: center; transition: all 0.15s ease;
+    }
+    .ma-btn-icon:hover { background: var(--ma-hover); color: var(--ma-text); }
+    .ma-panel__tabs { display: flex; padding: 0 16px; border-bottom: 1px solid var(--ma-border); gap: 4px; }
+    .ma-tab {
+      padding: 12px 16px; border: none; background: transparent;
+      color: var(--ma-text-3); font-size: 13px; font-weight: 600; letter-spacing: 0.5px;
+      cursor: pointer; position: relative; transition: color 0.15s ease;
+    }
+    .ma-tab:hover { color: var(--ma-text-2); }
+    .ma-tab--active { color: var(--ma-accent); }
+    .ma-tab--active::after {
+      content: ''; position: absolute; bottom: -1px; left: 16px; right: 16px;
+      height: 2px; background: var(--ma-accent); border-radius: 1px;
+    }
+    .ma-panel__body { flex: 1; overflow-y: auto; min-height: 200px; max-height: calc(76vh - 130px); }
+    .ma-panel__body::-webkit-scrollbar { width: 4px; }
+    .ma-panel__body::-webkit-scrollbar-track { background: transparent; }
+    .ma-panel__body::-webkit-scrollbar-thumb { background: var(--ma-border-strong); border-radius: 2px; }
+    .ma-tab-content { display: none; padding: 14px 18px; }
+    .ma-tab-content--active { display: block; }
+
+    .ma-search { position: relative; margin-bottom: 14px; }
+    .ma-search__input {
+      width: 100%; padding: 9px 12px 9px 34px;
+      background: var(--ma-surface); border: 1px solid var(--ma-border); border-radius: 8px;
+      color: var(--ma-text); font-size: 13px; outline: none;
+      transition: border-color 0.15s ease;
+    }
+    .ma-search__input:focus { border-color: var(--ma-accent); }
+    .ma-search__input::placeholder { color: var(--ma-text-3); }
+    .ma-search__icon {
+      position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+      color: var(--ma-text-3); font-size: 13px; pointer-events: none;
+    }
+
+    .ma-archive {
+      position: relative; background: var(--ma-surface);
+      border: 1px solid var(--ma-border); border-left: 3px solid var(--ma-border-strong);
+      border-radius: var(--ma-radius); padding: 14px 16px; margin-bottom: 10px;
+      transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+      cursor: pointer;
+    }
+    .ma-archive:hover {
+      border-color: var(--ma-border-strong); border-left-color: var(--ma-accent);
+      background: var(--ma-elevated); transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    }
+    .ma-archive__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 7px; }
+    .ma-archive__name {
+      font-family: var(--ma-font-serif); font-size: 15px; font-weight: 600;
+      color: var(--ma-text); flex: 1; word-break: break-word; line-height: 1.5;
+    }
+    .ma-archive__date { font-size: 11px; color: var(--ma-text-3); white-space: nowrap; font-family: var(--ma-mono); }
+    .ma-archive__meta { font-size: 12px; color: var(--ma-text-3); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .ma-archive__tag {
+      display: inline-block; padding: 2px 7px; background: var(--ma-accent-bg);
+      color: var(--ma-accent); border-radius: 4px; font-size: 11px; font-weight: 500;
+    }
+    .ma-archive__actions { display: flex; gap: 6px; margin-top: 11px; opacity: 0; transition: opacity 0.15s ease; flex-wrap: wrap; }
+    .ma-archive:hover .ma-archive__actions { opacity: 1; }
+    .ma-btn-sm {
+      padding: 6px 12px; border: 1px solid var(--ma-border); background: transparent;
+      color: var(--ma-text-2); font-size: 12px; border-radius: 5px; cursor: pointer;
+      transition: all 0.15s ease; white-space: nowrap;
+    }
+    .ma-btn-sm:hover { border-color: var(--ma-accent); color: var(--ma-accent); background: var(--ma-accent-bg); }
+    .ma-btn-sm--danger:hover { border-color: var(--ma-danger); color: var(--ma-danger); background: var(--ma-danger-bg); }
+
+    .ma-empty { text-align: center; padding: 44px 20px; color: var(--ma-text-3); font-size: 14px; }
+    .ma-empty__icon { font-size: 28px; margin-bottom: 10px; opacity: 0.4; }
+
+    .ma-setting-group { margin-bottom: 18px; }
+    .ma-setting-label {
+      font-size: 10.5px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase;
+      color: var(--ma-text-3); margin-bottom: 9px; display: block;
+    }
+    .ma-btn {
+      padding: 10px 16px; border: 1px solid var(--ma-border); background: var(--ma-surface);
+      color: var(--ma-text); font-size: 13px; font-weight: 500; border-radius: 8px;
+      cursor: pointer; transition: all 0.15s ease;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .ma-btn:hover { border-color: var(--ma-accent); background: var(--ma-accent-bg); }
+    .ma-btn--full { width: 100%; justify-content: center; }
+    .ma-btn--accent { border-color: var(--ma-accent); color: var(--ma-accent); background: var(--ma-accent-bg); }
+    .ma-btn--danger { border-color: rgba(192,122,106,0.3); color: var(--ma-danger); }
+    .ma-info {
+      background: var(--ma-surface); border-radius: 8px; padding: 11px 13px;
+      font-size: 13px; color: var(--ma-text-2); line-height: 1.7; margin-bottom: 10px;
+    }
+    .ma-info code { font-family: var(--ma-mono); color: var(--ma-accent); font-size: 12px; }
+
+    #ma-debug-log {
+      font-family: var(--ma-mono); font-size: 11px; line-height: 1.8;
+      max-height: 300px; overflow-y: auto; padding: 8px 0;
+    }
+    #ma-debug-log::-webkit-scrollbar { width: 3px; }
+    #ma-debug-log::-webkit-scrollbar-thumb { background: var(--ma-border-strong); }
+    .ma-log { padding: 2px 0; color: var(--ma-text-3); word-break: break-all; }
+    .ma-log--info { color: var(--ma-text-2); }
+    .ma-log--warn { color: var(--ma-accent); }
+    .ma-log--error { color: var(--ma-danger); }
+    .ma-log--success { color: var(--ma-success); }
+
+    .ma-panel__footer {
+      padding: 9px 18px; border-top: 1px solid var(--ma-border);
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 11px; color: var(--ma-text-3); background: var(--ma-bg);
+    }
+    .ma-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ma-success); display: inline-block; margin-right: 5px; }
+    .ma-status-dot--warn { background: var(--ma-accent); }
+    .ma-status-dot--error { background: var(--ma-danger); }
+
+    #ma-fab {
+      position: fixed; bottom: 24px; right: 24px; width: 46px; height: 46px;
+      border-radius: 50%; background: var(--ma-bg); border: 1px solid var(--ma-border-strong);
+      color: var(--ma-accent); font-size: 18px; cursor: pointer; z-index: 2147483645;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      animation: ma-float 5s ease-in-out infinite;
+    }
+    @keyframes ma-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+    #ma-fab:hover {
+      border-color: var(--ma-accent);
+      box-shadow: 0 6px 26px rgba(94,203,194,0.35);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #ma-panel::before { animation: none; }
+      #ma-fab { animation: none; }
+    }
+
+    #ma-toast {
+      position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px);
+      background: var(--ma-bg); border: 1px solid var(--ma-border-strong); border-radius: 10px;
+      padding: 11px 22px; font-size: 13.5px; color: var(--ma-text); z-index: 2147483647;
+      opacity: 0; transition: all 0.3s ease; box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    #ma-toast.ma-show { transform: translateX(-50%) translateY(0); opacity: 1; }
+    #ma-toast.ma-toast--success { border-color: rgba(111,184,168,0.4); }
+    #ma-toast.ma-toast--error { border-color: rgba(192,122,106,0.4); }
+    #ma-toast.ma-toast--warn { border-color: rgba(215,154,92,0.4); }
+
+    .ma-viewer {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 2147483647;
+      display: none; align-items: center; justify-content: center;
+      backdrop-filter: blur(4px);
+    }
+    .ma-viewer--show { display: flex; }
+    .ma-viewer__box {
+      width: 90%; max-width: 620px; max-height: 82vh; background: var(--ma-bg);
+      border: 1px solid var(--ma-border-strong); border-radius: 16px;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .ma-viewer__header {
+      padding: 16px 20px; border-bottom: 1px solid var(--ma-border);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .ma-viewer__title { font-family: var(--ma-font-serif); font-size: 16px; font-weight: 600; color: var(--ma-text); }
+    .ma-viewer__body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+    .ma-viewer__msg {
+      margin-bottom: 14px; padding: 12px 15px; border-radius: 10px;
+      font-size: 14px; line-height: 1.7; max-width: 85%;
+    }
+    .ma-viewer__msg--user { background: var(--ma-elevated); margin-left: auto; text-align: right; }
+    .ma-viewer__msg--ai { background: var(--ma-surface); border: 1px solid var(--ma-border); }
+    .ma-viewer__role {
+      font-size: 10.5px; color: var(--ma-text-3); text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 5px;
+    }
+    @media (max-width: 480px) {
+      #ma-panel { width: calc(100vw - 32px); right: 16px; max-height: 64vh; }
+      #ma-fab { bottom: 16px; right: 16px; }
+    }
+  `;
+
+  /* ════════════════════════════════════════════════════════════════
+   * UI — HTML TEMPLATE
+   * ════════════════════════════════════════════════════════════════ */
+  function getPanelHTML() {
+    return `
+      <div id="ma-panel" class="ma-hidden">
+        <div class="ma-panel__header" id="ma-drag-handle">
+          <div class="ma-panel__title">
+            <span class="ma-panel__title-main">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2h4M11 2v4.2c0 .5-.2.9-.5 1.3L7 11.2c-.9 1.1-1.5 2.6-1.5 4.1V18a4 4 0 0 0 4 4h5a4 4 0 0 0 4-4v-2.7c0-1.5-.6-3-1.5-4.1l-3.5-3.7a2 2 0 0 1-.5-1.3V2"/><path d="M7.5 15.5h9" stroke-dasharray="1.2 2.4"/></svg>
+              漂流瓶
+            </span>
+            <span class="ma-panel__title-sub">Mufy Archive · 打捞记忆</span>
+          </div>
+          <div class="ma-panel__ctrls">
+            <button class="ma-btn-icon" id="ma-btn-min" title="最小化">—</button>
+            <button class="ma-btn-icon" id="ma-btn-close" title="关闭">×</button>
+          </div>
+        </div>
+        <div class="ma-panel__tabs">
+          <button class="ma-tab ma-tab--active" data-tab="archives">存档</button>
+          <button class="ma-tab" data-tab="actions">操作</button>
+          <button class="ma-tab" data-tab="settings">设置</button>
+          <button class="ma-tab" data-tab="debug">调试</button>
+        </div>
+        <div class="ma-panel__body">
+          <!-- Archives tab -->
+          <div class="ma-tab-content ma-tab-content--active" data-tab-content="archives">
+            <div class="ma-search">
+              <span class="ma-search__icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
+              <input type="text" class="ma-search__input" id="ma-search" placeholder="在瓶子里打捞…" />
+            </div>
+            <div id="ma-archive-list"></div>
+          </div>
+
+          <!-- Actions tab -->
+          <div class="ma-tab-content" data-tab-content="actions">
+            <div class="ma-info" id="ma-ctx-hint" style="display:none;border-left:2px solid var(--ma-seal);">
+              <b>未进入会话</b>：当前页面（例如探索页 /explore）没有聊天上下文，这是正常现象。
+              进入任意角色的聊天页后，角色 / 会话 ID 会自动识别；也可点调试里的「刷新上下文」。
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">当前会话</span>
+              <div class="ma-info" id="ma-ctx-info">
+                <div>角色: <code id="ma-ctx-char">--</code></div>
+                <div>面具: <code id="ma-ctx-mask">--</code></div>
+                <div>会话: <code id="ma-ctx-session">--</code></div>
+              </div>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">快捷操作</span>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                <button class="ma-btn ma-btn--accent" id="ma-btn-save">保存当前对话</button>
+                <button class="ma-btn" id="ma-btn-capture">从页面抓取</button>
+              </div>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">伪装载入 (L2)</span>
+              <div class="ma-info">
+                拦截 <code>GET /api/dialogs/query</code> 响应，用本地存档替换返回内容。仅视觉效果，不写服务器。
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="ma-btn" id="ma-btn-phantom-select">选择存档载入…</button>
+                <button class="ma-btn ma-btn--danger" id="ma-btn-phantom-clear" style="display:none;">清除伪装</button>
+              </div>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">前情提要</span>
+              <div class="ma-info">
+                将选中存档压缩为前情摘要，填入输入框或自动发送，让 AI 恢复记忆。
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="ma-btn" id="ma-btn-summary-select">选择存档生成摘要…</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Settings tab -->
+          <div class="ma-tab-content" data-tab-content="settings">
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">数据管理</span>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="ma-btn ma-btn--full" id="ma-btn-export-all">导出全部存档</button>
+                <button class="ma-btn ma-btn--full" id="ma-btn-import">导入 JSON 文件</button>
+                <input type="file" id="ma-import-input" accept=".json" style="display:none" />
+              </div>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">Token / 鉴权</span>
+              <div class="ma-info">
+                Token: <code id="ma-token-display">--</code>
+              </div>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">危险区</span>
+              <button class="ma-btn ma-btn--danger ma-btn--full" id="ma-btn-clear-all">清空所有本地存档</button>
+            </div>
+            <div class="ma-setting-group">
+              <span class="ma-setting-label">关于</span>
+              <div class="ma-info">
+                Mufy Archive v1.2.3<br/>
+                无限本地存档 · 视觉层伪装载入 · 前情提要注入<br/>
+                <span style="color:var(--ma-text-3)">数据仅存储在本地 IndexedDB，不上传任何服务器。</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Debug tab -->
+          <div class="ma-tab-content" data-tab-content="debug">
+            <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;">
+              <button class="ma-btn-sm" id="ma-btn-clear-log">清空日志</button>
+              <button class="ma-btn-sm" id="ma-btn-refresh-ctx">刷新上下文</button>
+              <button class="ma-btn-sm" id="ma-btn-copy-log">复制日志</button>
+              <button class="ma-btn-sm" id="ma-btn-copy-net">复制网络清单</button>
+            </div>
+            <div id="ma-debug-log"></div>
+          </div>
+        </div>
+        <div class="ma-panel__footer">
+          <span><span class="ma-status-dot" id="ma-status-dot"></span><span id="ma-status-text">就绪</span></span>
+          <span id="ma-archive-count">0 条存档</span>
+        </div>
+      </div>
+
+      <button id="ma-fab" title="Mufy Archive · 漂流瓶">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 2h4M11 2v4.2c0 .5-.2.9-.5 1.3L7 11.2c-.9 1.1-1.5 2.6-1.5 4.1V18a4 4 0 0 0 4 4h5a4 4 0 0 0 4-4v-2.7c0-1.5-.6-3-1.5-4.1l-3.5-3.7a2 2 0 0 1-.5-1.3V2"/>
+          <path d="M7.5 15.5h9" stroke-dasharray="1.2 2.4"/>
+        </svg>
+      </button>
+
+      <div id="ma-toast"></div>
+
+      <div class="ma-viewer" id="ma-viewer">
+        <div class="ma-viewer__box">
+          <div class="ma-viewer__header">
+            <span class="ma-viewer__title" id="ma-viewer-title">对话查看</span>
+            <button class="ma-btn-icon" id="ma-viewer-close">×</button>
+          </div>
+          <div class="ma-viewer__body" id="ma-viewer-body"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+   * UI — LOGIC
+   * ════════════════════════════════════════════════════════════════ */
+  const UI = {
+    async inject() {
+      if (document.getElementById(CONFIG.CSS_ID)) return;
+
+      const style = document.createElement('style');
+      style.id = CONFIG.CSS_ID;
+      style.textContent = CSS;
+      (document.head || document.documentElement).appendChild(style);
+
+      // v1.2.2：挂到 documentElement —— 防 React 类框架 hydrate 时清掉面板
+      const container = document.createElement('div');
+      container.innerHTML = getPanelHTML();
+      (document.documentElement || document.body).appendChild(container);
+
+      try { await DB.open(); Log.add('IndexedDB opened'); }
+      catch (e) { Log.add(`IndexedDB open failed: ${e.message}`, 'error'); }
+
+      this.bindEvents();
+
+      // v1.2.3 修复：F5 后伪装仍在，但「清除伪装」按钮此前不会自动亮起
+      if (State.phantom.active) {
+        const clearBtn = document.getElementById('ma-btn-phantom-clear');
+        if (clearBtn) clearBtn.style.display = '';
+      }
+
+      await this.renderArchives();
+      this.updateContext();
+
+      document.getElementById('ma-fab').style.display = 'flex';
+
+      // v1.2.2：每标签页首次加载自动弹出面板
+      let autoOpened = false;
+      try { autoOpened = sessionStorage.getItem('ma-auto-opened') === '1'; } catch {}
+      if (!autoOpened) {
+        this.show();
+        try { sessionStorage.setItem('ma-auto-opened', '1'); } catch {}
+      }
+
+      Log.add('UI ready');
+    },
+
+    bindEvents() {
+      document.getElementById('ma-fab').addEventListener('click', () => this.toggle());
+      document.getElementById('ma-btn-min').addEventListener('click', () => this.toggle());
+      document.getElementById('ma-btn-close').addEventListener('click', () => this.hide());
+
+      document.querySelectorAll('.ma-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+          const target = tab.dataset.tab;
+          document.querySelectorAll('.ma-tab').forEach(t => t.classList.toggle('ma-tab--active', t === tab));
+          document.querySelectorAll('.ma-tab-content').forEach(c => c.classList.toggle('ma-tab-content--active', c.dataset.tabContent === target));
+        });
+      });
+
+      const searchInput = document.getElementById('ma-search');
+      searchInput.addEventListener('input', Utils.debounce(() => this.renderArchives(searchInput.value), 250));
+
+      document.getElementById('ma-btn-save').addEventListener('click', () => this.actionSaveCurrent());
+      document.getElementById('ma-btn-capture').addEventListener('click', () => this.actionCapture());
+      document.getElementById('ma-btn-phantom-select').addEventListener('click', () => this.actionPhantomSelect());
+      document.getElementById('ma-btn-phantom-clear').addEventListener('click', () => this.actionPhantomClear());
+      document.getElementById('ma-btn-summary-select').addEventListener('click', () => this.actionSummarySelect());
+      document.getElementById('ma-btn-export-all').addEventListener('click', () => this.actionExportAll());
+      document.getElementById('ma-btn-import').addEventListener('click', () => document.getElementById('ma-import-input').click());
+      document.getElementById('ma-import-input').addEventListener('change', (e) => this.actionImport(e.target.files[0]));
+      document.getElementById('ma-btn-clear-all').addEventListener('click', () => this.actionClearAll());
+      document.getElementById('ma-btn-clear-log').addEventListener('click', () => {
+        State.logs = [];
+        const el = document.getElementById('ma-debug-log');
+        if (el) el.innerHTML = '';
+      });
+      document.getElementById('ma-btn-copy-log').addEventListener('click', () => this.actionCopyLog());
+      document.getElementById('ma-btn-copy-net').addEventListener('click', () => this.actionCopyNet());
+      document.getElementById('ma-btn-refresh-ctx').addEventListener('click', () => {
+        Context.detect();
+        this.updateContext();
+        // v1.2.3：给操作反馈，不再"没反应"
+        const c = State.ctx;
+        this.showToast(
+          c.ready
+            ? `已刷新：${(c.characterName || c.characterId || '').slice(0, 12)}${c.sessionId ? ' · 会话已识别' : ' · 无会话'}`
+            : '仍未进入会话：请打开某个角色的聊天页',
+          c.ready ? 'success' : 'warn'
+        );
+      });
+
+      document.getElementById('ma-viewer-close').addEventListener('click', () => {
+        document.getElementById('ma-viewer').classList.remove('ma-viewer--show');
+      });
+      document.getElementById('ma-viewer').addEventListener('click', (e) => {
+        if (e.target.id === 'ma-viewer') e.target.classList.remove('ma-viewer--show');
+      });
+
+      this.makeDraggable();
+    },
+
+    makeDraggable() {
+      const panel = document.getElementById('ma-panel');
+      const handle = document.getElementById('ma-drag-handle');
+      let isDragging = false;
+      let startX, startY, startLeft, startTop;
+
+      handle.addEventListener('mousedown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        isDragging = true;
+        const rect = panel.getBoundingClientRect();
+        startX = e.clientX; startY = e.clientY;
+        startLeft = rect.left; startTop = rect.top;
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        let newLeft = startLeft + dx;
+        let newTop = startTop + dy;
+        newLeft = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, newLeft));
+        newTop = Math.max(0, Math.min(window.innerHeight - 100, newTop));
+        panel.style.left = newLeft + 'px';
+        panel.style.top = newTop + 'px';
+        panel.style.right = 'auto';
+      });
+      document.addEventListener('mouseup', () => { isDragging = false; });
+    },
+
+    toggle() {
+      const panel = document.getElementById('ma-panel');
+      const isVisible = !panel.classList.contains('ma-hidden');
+      if (isVisible) { this.hide(); } else { this.show(); }
+    },
+    show() {
+      const panel = document.getElementById('ma-panel');
+      panel.classList.remove('ma-hidden');
+      State.panelVisible = true;
+    },
+    hide() {
+      const panel = document.getElementById('ma-panel');
+      panel.classList.add('ma-hidden');
+      State.panelVisible = false;
+    },
+
+    async renderArchives(filter = '') {
+      const listEl = document.getElementById('ma-archive-list');
+      if (!listEl) return;
+
+      let archives = await DB.getAll();
+      archives.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+      if (filter) {
+        const q = filter.toLowerCase();
+        archives = archives.filter(a =>
+          (a.name || '').toLowerCase().includes(q) ||
+          (a.characterName || '').toLowerCase().includes(q) ||
+          (a.note || '').toLowerCase().includes(q)
+        );
+      }
+
+      const countEl = document.getElementById('ma-archive-count');
+      if (countEl) countEl.textContent = `${archives.length} 条存档`;
+
+      if (archives.length === 0) {
+        listEl.innerHTML = `
+          <div class="ma-empty">
+            <div class="ma-empty__icon">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 2h4M11 2v4.2c0 .5-.2.9-.5 1.3L7 11.2c-.9 1.1-1.5 2.6-1.5 4.1V18a4 4 0 0 0 4 4h5a4 4 0 0 0 4-4v-2.7c0-1.5-.6-3-1.5-4.1l-3.5-3.7a2 2 0 0 1-.5-1.3V2"/>
+                <path d="M7.5 15.5h9" stroke-dasharray="1.2 2.4"/>
+              </svg>
+            </div>
+            <div>海面空荡荡，还没有瓶子</div>
+            <div style="font-size:12px;margin-top:5px;">去「操作」标签页，把当前对话封进一只瓶子</div>
+          </div>`;
+        return;
+      }
+
+      listEl.innerHTML = archives.map(a => {
+        const dialogCount = (a.dialogs || []).length;
+        const isPhantom = State.phantom.active && State.phantom.archiveId === a.id;
+        return `
+          <div class="ma-archive" data-id="${a.id}">
+            <div class="ma-archive__head">
+              <div class="ma-archive__name">${Utils.escapeHtml(a.name || '未命名存档')}</div>
+              <div class="ma-archive__date">${Utils.formatDate(a.createdAt)}</div>
+            </div>
+            <div class="ma-archive__meta">
+              ${a.characterName ? `<span class="ma-archive__tag">${Utils.escapeHtml(a.characterName)}</span>` : ''}
+              <span>${dialogCount} 条对话</span>
+              ${a.source === 'import' ? '<span style="color:var(--ma-text-3)">导入</span>' : ''}
+              ${a.partial ? '<span style="color:var(--ma-seal);" title="抓取时可能未取全，建议重新保存一次">可能不完整</span>' : ''}
+              ${isPhantom ? '<span class="ma-archive__tag" style="background:var(--ma-accent-bg);color:var(--ma-accent);">漂流中 · 伪装载入</span>' : ''}
+            </div>
+            <div class="ma-archive__actions">
+              <button class="ma-btn-sm" data-action="view" data-id="${a.id}">查看</button>
+              <button class="ma-btn-sm" data-action="phantom" data-id="${a.id}">伪装载入</button>
+              <button class="ma-btn-sm" data-action="summary" data-id="${a.id}">摘要</button>
+              <button class="ma-btn-sm" data-action="export" data-id="${a.id}">导出</button>
+              <button class="ma-btn-sm ma-btn-sm--danger" data-action="delete" data-id="${a.id}">删除</button>
+            </div>
+          </div>`;
+      }).join('');
+
+      listEl.querySelectorAll('.ma-archive').forEach(card => {
+        card.addEventListener('click', (e) => {
+          const btn = e.target.closest('[data-action]');
+          if (!btn) return;
+          e.stopPropagation();
+          const id = btn.dataset.id;
+          const action = btn.dataset.action;
+          switch (action) {
+            case 'view': this.showViewer(id); break;
+            case 'phantom': this.actionPhantomLoad(id); break;
+            case 'summary': this.actionSummaryFor(id); break;
+            case 'export': this.actionExportOne(id); break;
+            case 'delete': this.actionDelete(id); break;
+          }
+        });
+      });
+    },
+
+    updateContext() {
+      const ctx = State.ctx;
+      const set = (id, val) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = val || '--';
+      };
+      set('ma-ctx-char', ctx.characterId);
+      set('ma-ctx-mask', ctx.maskId);
+      set('ma-ctx-session', ctx.sessionId);
+
+      const token = API.getToken();
+      const tokenEl = document.getElementById('ma-token-display');
+      if (tokenEl) {
+        tokenEl.textContent = token ? token.slice(0, 12) + '…' : '未检测到';
+      }
+
+      const statusDot = document.getElementById('ma-status-dot');
+      const statusText = document.getElementById('ma-status-text');
+      if (statusDot && statusText) {
+        if (ctx.ready) {
+          statusDot.className = 'ma-status-dot';
+          statusText.textContent = '就绪';
+        } else {
+          statusDot.className = 'ma-status-dot ma-status-dot--warn';
+          statusText.textContent = '未进入会话';
+        }
+      }
+
+      const hint = document.getElementById('ma-ctx-hint');
+      if (hint) hint.style.display = ctx.ready ? 'none' : 'block';
+    },
+
+    showToast(msg, type = 'info') {
+      const toast = document.getElementById('ma-toast');
+      if (!toast) { alert(msg); return; }
+      toast.textContent = msg;
+      toast.className = `ma-show ma-toast--${type}`;
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { toast.className = ''; }, 3000);
+    },
+
+    async showViewer(id) {
+      const archive = await DB.get(id);
+      if (!archive) return;
+      const dialogs = archive.dialogs || [];
+      const body = document.getElementById('ma-viewer-body');
+      const title = document.getElementById('ma-viewer-title');
+      title.textContent = archive.name || '对话查看';
+      body.innerHTML = '';
+      for (const d of dialogs) {
+        const role = d.role || d.type || (d.isBot ? 'assistant' : 'user');
+        const isUser = role === 'user' || role === 'human';
+        const content = d.content || d.text || d.message || '';
+        const roleLabel = isUser ? (archive.meta?.userName || '用户') : (archive.meta?.characterName || '角色');
+        const div = document.createElement('div');
+        div.className = `ma-viewer__msg ma-viewer__msg--${isUser ? 'user' : 'ai'}`;
+        div.innerHTML = `<div class="ma-viewer__role">${Utils.escapeHtml(roleLabel)}</div>${Utils.escapeHtml(content)}`;
+        body.appendChild(div);
+      }
+      document.getElementById('ma-viewer').classList.add('ma-viewer--show');
+    },
+
+    // ─── Actions ───
+
+    async actionSaveCurrent() {
+      const ctx = State.ctx;
+      if (!ctx.characterId) {
+        this.showToast('未进入会话：请先打开某个角色的聊天页再保存', 'warn');
+        return;
+      }
+
+      try {
+        this.showToast('正在抓取当前对话…');
+        let dialogs = [];
+        let source = 'active';
+        let pages = 0, total = null, partial = false;
+
+        if (ctx.sessionId) {
+          const t0 = Date.now();
+          const result = await API.queryDialogsAll(ctx.sessionId, ctx.characterId, {
+            onProgress: (got, tot) => {
+              this.showToast(tot ? `正在打捞 ${got}/${tot} 条…` : `已打捞 ${got} 条…`);
+            },
+          });
+          dialogs = result.dialogs;
+          pages = result.pages;
+          total = result.total;
+          partial = result.partial;
+          Log.add(
+            `分页抓取：${dialogs.length} 条 / ${pages} 页` +
+            (total != null ? ` / 服务端 total=${total}` : '') +
+            (partial ? '【不完整】' : '') +
+            `，耗时 ${Date.now() - t0}ms`,
+            partial ? 'warn' : 'info'
+          );
+        }
+
+        if (!dialogs.length && State.captured.dialogs?.length) {
+          const meta = State.captured.dialogsMeta;
+          const matches = !meta || !ctx.sessionId || meta.sessionId === ctx.sessionId;
+          if (matches) {
+            dialogs = State.captured.dialogs;
+            source = 'passive-cache';
+            partial = dialogs.length >= 100;
+            Log.add(`主动请求为空，回退到被动捕获的 ${dialogs.length} 条${partial ? '（可能不完整）' : ''}`, 'warn');
+          }
+        }
+
+        if (!dialogs.length) {
+          this.showToast('未抓取到对话数据，请确保当前页面有对话', 'warn');
+          return;
+        }
+
+        const archive = {
+          id: Utils.uuid(),
+          name: `${ctx.characterName || '角色'} - ${new Date().toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`,
+          characterId: ctx.characterId,
+          characterName: ctx.characterName,
+          sessionId: ctx.sessionId,
+          dialogs,
+          meta: {
+            userName: ctx.userName,
+            characterName: ctx.characterName,
+            maskId: ctx.maskId,
+          },
+          createdAt: Date.now(),
+          source: 'capture',
+          fetchSource: source,
+          partial,
+          fetchMeta: { pages, total, partial },
+        };
+        await DB.put(archive);
+        Log.add(`Saved archive: ${archive.name} (${dialogs.length} dialogs, via ${source}${partial ? ', PARTIAL' : ''})`, partial ? 'warn' : 'success');
+        this.showToast(
+          partial ? `已保存 ${dialogs.length} 条，但抓取不完整，建议重试一次` : `已保存 ${dialogs.length} 条对话`,
+          partial ? 'warn' : 'success'
+        );
+        this.renderArchives();
+      } catch (e) {
+        Log.add(`Save failed: ${e.message}`, 'error');
+        this.showToast('保存失败: ' + e.message, 'error');
+      }
+    },
+
+    async actionCapture() {
+      const ci = State.captured.characterInfo;
+      if (ci) {
+        State.ctx.maskId = ci.currentMaskId ?? State.ctx.maskId;
+        State.ctx.modelId = ci.modelId ?? State.ctx.modelId;
+        State.ctx.modelTemplateId = ci.modelTemplateId ?? State.ctx.modelTemplateId;
+        State.ctx.characterName = ci.name || State.ctx.characterName;
+        this.updateContext();
+        this.showToast('已从页面捕获最新信息', 'success');
+      } else {
+        this.showToast('暂无可捕获的数据，请先浏览角色页面', 'warn');
+      }
+    },
+
+    async actionPhantomLoad(id) {
+      const archive = await DB.get(id);
+      if (!archive || !archive.dialogs) {
+        this.showToast('存档数据不完整', 'error');
+        return;
+      }
+      State.phantom.active = true;
+      State.phantom.dialogs = archive.dialogs;
+      State.phantom.archiveId = id;
+      Phantom.persist();
+      document.getElementById('ma-btn-phantom-clear').style.display = '';
+      Log.add(`Phantom load activated: ${archive.name}, 即将强制刷新页面`, 'success');
+      this.showToast('伪装载入已记录，2 秒后自动刷新页面…', 'info');
+      setTimeout(() => location.reload(), 2000);
+    },
+
+    actionPhantomClear() {
+      State.phantom.active = false;
+      State.phantom.dialogs = null;
+      State.phantom.archiveId = null;
+      Phantom.persist();
+      document.getElementById('ma-btn-phantom-clear').style.display = 'none';
+      this.showToast('已清除伪装载入', 'info');
+      Log.add('Phantom load cleared');
+      this.renderArchives();
+    },
+
+    actionPhantomSelect() {
+      document.querySelector('.ma-tab[data-tab="archives"]').click();
+      this.showToast('请在下方列表点击「伪装载入」', 'info');
+    },
+
+    async actionSummaryFor(id) {
+      const archive = await DB.get(id);
+      if (!archive || !archive.dialogs) {
+        this.showToast('存档数据不完整', 'error');
+        return;
+      }
+      const summary = Summary.generate(archive);
+      this.showSummaryDialog(summary, archive);
+    },
+
+    actionSummarySelect() {
+      document.querySelector('.ma-tab[data-tab="archives"]').click();
+      this.showToast('请在下方列表点击「摘要」', 'info');
+    },
+
+    showSummaryDialog(summary, archive) {
+      const modal = document.createElement('div');
+      modal.className = 'ma-viewer ma-viewer--show';
+      modal.innerHTML = `
+        <div class="ma-viewer__box">
+          <div class="ma-viewer__header">
+            <span class="ma-viewer__title">前情提要 — ${Utils.escapeHtml(archive.name || '')}</span>
+            <button class="ma-btn-icon" onclick="this.closest('.ma-viewer').remove()">×</button>
+          </div>
+          <div class="ma-viewer__body">
+            <div style="background:var(--ma-surface);border-radius:8px;padding:14px;font-size:13.5px;line-height:1.7;color:var(--ma-text);white-space:pre-wrap;">${Utils.escapeHtml(summary)}</div>
+          </div>
+          <div style="padding:12px 20px;border-top:1px solid var(--ma-border);display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="ma-btn ma-btn--accent" id="ma-summary-autosend">自动发送</button>
+            <button class="ma-btn" id="ma-summary-fill">填入输入框</button>
+            <button class="ma-btn" id="ma-summary-copy">复制文本</button>
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+
+      modal.querySelector('#ma-summary-autosend').addEventListener('click', async () => {
+        const ok = await Summary.autoSend(summary);
+        if (ok) {
+          this.showToast('前情提要已发送', 'success');
+          modal.remove();
+        } else {
+          this.showToast('发送失败，请查看调试日志', 'error');
+        }
+      });
+      modal.querySelector('#ma-summary-fill').addEventListener('click', () => {
+        Summary.fillInputBox(summary);
+        this.showToast('已填入输入框', 'info');
+        modal.remove();
+      });
+      modal.querySelector('#ma-summary-copy').addEventListener('click', () => {
+        navigator.clipboard.writeText(summary).then(() => {
+          this.showToast('已复制到剪贴板', 'success');
+        }).catch(() => {
+          this.showToast('复制失败', 'error');
+        });
+      });
+    },
+
+    async actionExportOne(id) {
+      const archive = await DB.get(id);
+      if (!archive) return;
+      const json = JSON.stringify(archive, null, 2);
+      const name = (archive.name || 'archive').replace(/[^\w\u4e00-\u9fa5-]/g, '_');
+      Utils.download(`mufy-${name}.json`, json);
+      Log.add(`Exported: ${archive.name}`);
+      this.showToast('已导出', 'success');
+    },
+
+    async actionExportAll() {
+      const archives = await DB.getAll();
+      if (!archives.length) {
+        this.showToast('没有存档可导出', 'warn');
+        return;
+      }
+      const json = JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), archives }, null, 2);
+      Utils.download(`mufy-archive-all-${Date.now()}.json`, json);
+      this.showToast(`已导出 ${archives.length} 条存档`, 'success');
+    },
+
+    async actionImport(file) {
+      if (!file) return;
+      try {
+        const data = await Utils.readJsonFile(file);
+        let archives = [];
+        if (Array.isArray(data)) archives = data;
+        else if (data.archives) archives = data.archives;
+        else if (data.dialogs) archives = [data];
+        else archives = [data];
+
+        let count = 0;
+        for (const a of archives) {
+          if (!a.id) a.id = Utils.uuid();
+          if (!a.createdAt) a.createdAt = Date.now();
+          if (a.source !== 'capture') a.source = 'import';
+          await DB.put(a);
+          count++;
+        }
+        Log.add(`Imported ${count} archives`, 'success');
+        this.showToast(`已导入 ${count} 条存档`, 'success');
+        this.renderArchives();
+      } catch (e) {
+        this.showToast('导入失败: ' + e.message, 'error');
+      }
+      const input = document.getElementById('ma-import-input');
+      if (input) input.value = '';
+    },
+
+    async actionDelete(id) {
+      const archive = await DB.get(id);
+      if (!archive) return;
+      if (!confirm(`确定删除「${archive.name || '未命名'}」？此操作不可撤销。`)) return;
+      await DB.delete(id);
+      if (State.phantom.archiveId === id) this.actionPhantomClear();
+      Log.add(`Deleted: ${archive.name}`);
+      this.showToast('已删除', 'info');
+      this.renderArchives();
+    },
+
+    async actionClearAll() {
+      if (!confirm('确定清空所有本地存档？此操作不可撤销。')) return;
+      await DB.clear();
+      State.phantom.active = false;
+      State.phantom.dialogs = null;
+      State.phantom.archiveId = null;
+      Log.add('All archives cleared', 'warn');
+      this.showToast('已清空所有存档', 'warn');
+      this.renderArchives();
+    },
+
+    actionCopyLog() {
+      if (!State.logs.length) {
+        this.showToast('日志是空的', 'warn');
+        return;
+      }
+      const text = State.logs.map((l) => `[${l.time}] [${l.level}] ${l.msg}`).join('\n');
+      navigator.clipboard.writeText(text).then(() => {
+        this.showToast('日志已复制，直接粘贴给 AI / 拖拖', 'success');
+      }).catch(() => {
+        this.showToast('复制失败，请手动选中日志文本复制', 'error');
+      });
+    },
+
+    // ─── v1.2.3 新增：网络审计清单（诊断伪装载入通道的关键工具）───
+    actionCopyNet() {
+      if (!State.netLog.length) {
+        this.showToast('网络清单是空的，先在聊天页随便点点再回来', 'warn');
+        return;
+      }
+      const head = `Phantom=${State.phantom.active ? 'ON' : 'OFF'} · 页面=${location.pathname}${location.search}`;
+      const text = [head, ...State.netLog].join('\n');
+      navigator.clipboard.writeText(text).then(() => {
+        this.showToast('网络清单已复制，发给 AI', 'success');
+      }).catch(() => {
+        this.showToast('复制失败，请手动选中复制', 'error');
+      });
+    },
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   * INIT
+   * ════════════════════════════════════════════════════════════════ */
+  function init() {
+    Interceptor.install();
+    Phantom.restore();
+
+    function onDOMReady() {
+      UI.inject().then(() => {
+        Context.detect();
+        UI.updateContext();
+        // v1.2.3：拦截器抓到新上下文时，面板立即联动刷新
+        window.addEventListener('ma-ctx-updated', () => UI.updateContext());
+        Context.onNavigate(() => {
+          setTimeout(() => {
+            Context.detect();
+            UI.updateContext();
+          }, 500);
+        });
+      });
+
+      let attempts = 0;
+      const ctxTimer = setInterval(() => {
+        Context.detect();
+        if (document.getElementById('ma-ctx-char')) UI.updateContext();
+        if (State.ctx.ready || attempts++ > 24) clearInterval(ctxTimer);
+      }, 5000);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', onDOMReady);
+    } else {
+      onDOMReady();
+    }
+
+    console.log('%c 漂流瓶 %c Mufy Archive v1.2.3 ',
+      'background:#5ecbc2;color:#06141f;font-weight:bold;padding:2px 6px;border-radius:3px 0 0 3px',
+      'background:#0b1f30;color:#5ecbc2;padding:2px 6px;border-radius:0 3px 3px 0');
+  }
+
+  init();
+})();
